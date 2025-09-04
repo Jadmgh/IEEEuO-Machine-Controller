@@ -1,10 +1,10 @@
 import os
-from fastapi import FastAPI, Request, Header
+from fastapi import FastAPI, Request, Header, BackgroundTasks
 import httpx
 import uvicorn
-from pydantic import BaseModel
+from dotenv import load_dotenv
 
-# import RPi.GPIO as GPIO
+import RPi.GPIO as GPIO
 import time
 
 
@@ -28,13 +28,10 @@ RELAY_PINS = {
 }
 
 
-# GPIO.setmode(GPIO.BCM)
-# for pin in RELAY_PINS.values():
-#     GPIO.setup(pin, GPIO.OUT)
-#     GPIO.output(pin, GPIO.HIGH)
 
 app = FastAPI()
-SQUARE_ACCESS_TOKEN
+load_dotenv()
+SQUARE_ACCESS_TOKEN = os.getenv("SQUARE_ACCESS_TOKEN")
 SQUARE_API_BASE = "https://connect.squareupsandbox.com/v2"
 HEADERS = {
     "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
@@ -67,23 +64,24 @@ SLOT_RELAY = {
     "F4": [6, 7, 12, 13],
 }
 
+processed_orders = set()
 
-@app.post("/webhook/square")
-async def handle_square_webhook(request: Request):
-    payload = await request.json()
-    print("Payload:", payload)
-    print()
+async def handle_square_event(payload):
     event_type = payload.get("type")
-
-    if event_type != "payment.updated":
-        return {"message": "Ignoring non-payment update event"}
+    event_id = payload.get("id")
 
     payment = payload.get("data", {}).get("object").get("payment", {})
     status = payment.get("status")
     order_id = payment.get("order_id")
 
-    if status != "COMPLETED" or not order_id:
-        return {"message": "Ignoring non-completed payment or missing order ID"}
+    if event_type != "payment.updated" or status != "COMPLETED" or not order_id:
+        return {"message": "Ignoring event"}
+    
+    if order_id in processed_orders:
+        print(f"Ignoring duplicate webhook for order {order_id}")
+        return {"message": "Already processed"}
+
+    processed_orders.add(order_id)
 
     async with httpx.AsyncClient() as client:
         # Fetch the full order
@@ -99,7 +97,6 @@ async def handle_square_webhook(request: Request):
         order_data = order_response.json()
         line_items = order_data.get("order", {}).get("line_items", [])
 
-        print("Order data fetched successfully:", line_items)
         print(f"Order {order_id} fetched successfully. Processing line items...")
 
         for item in line_items:
@@ -114,11 +111,8 @@ async def handle_square_webhook(request: Request):
             obj_url = f"{SQUARE_API_BASE}/catalog/object/{catalog_object_id}"
             obj_response = await client.get(obj_url, headers=HEADERS)
 
-            print(obj_response)
-
             if obj_response.status_code == 200:
                 object_data = obj_response.json()
-                print(f"Custom attributes for {catalog_object_id}:", object_data)
 
                 # Extract custom attributes dictionary
                 custom_attrs = object_data["object"].get("custom_attribute_values", {})
@@ -139,11 +133,9 @@ async def handle_square_webhook(request: Request):
                 print(
                     f"Fetching custom attribute definition {definition_id} for {catalog_object_id}..."
                 )
-                print(definition_response)
 
                 if definition_response.status_code == 200:
                     definition = definition_response.json()
-                    print(definition)
                     allowed_selections = definition["object"][
                         "custom_attribute_definition_data"
                     ]["selection_config"]["allowed_selections"]
@@ -169,9 +161,20 @@ async def handle_square_webhook(request: Request):
                             GPIO.output(RELAY_PINS[pin], GPIO.HIGH)
                     else:
                         print(f"Selection UID {selection_uid} not found in definition")
+        return {"message": "Dispensing item"}
+    
 
-    return {"message": "Dispensing item from slot"}
+@app.post("/webhook/square")
+async def handle_square_webhook(request: Request, background_tasks: BackgroundTasks,):
+    payload = await request.json()
+    background_tasks.add_task(handle_square_event, payload)
+
+    return {"message": "Webhook received and processing started"}
 
 
 if __name__ == "__main__":
+    GPIO.setmode(GPIO.BCM)
+    for pin in RELAY_PINS.values():
+        GPIO.setup(pin, GPIO.OUT)
+        GPIO.output(pin, GPIO.HIGH)
     uvicorn.run(app, port=8000, host="0.0.0.0")
